@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Expense Manager</title>
+  <link rel="stylesheet" href="styles.css" />
+  <!-- Chart.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Expense Manager</h1>
+    <p class="subtitle">Track spending, view reports</p>
+  </header>
+
+  <main class="container">
+    <section class="left-col card">
+      <h2>Add Expense</h2>
+      <form id="expense-form" class="form">
+        <label>
+          Date
+          <input type="date" id="date" required />
+        </label>
+        <label>
+          Category
+          <input type="text" id="category" placeholder="Groceries" required />
+        </label>
+        <label>
+          Amount
+          <input type="number" id="amount" step="0.01" min="0" placeholder="0.00" required />
+        </label>
+        <label>
+          Description
+          <input type="text" id="description" placeholder="Optional notes" />
+        </label>
+        <div class="form-actions">
+          <button type="submit" class="btn primary">Add Expense</button>
+          <button type="button" id="refresh-btn" class="btn">Refresh</button>
+        </div>
+      </form>
+
+      <hr />
+
+      <h2>Expenses</h2>
+      <div class="table-wrap">
+        <table id="expenses-table">
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Category</th>
+              <th>Amount</th>
+              <th>Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <!-- rows inserted by JS -->
+          </tbody>
+        </table>
+      </div>
+      <div class="pagination">
+        <button id="prev-page" class="btn">Prev</button>
+        <span id="page-info">Page 1</span>
+        <button id="next-page" class="btn">Next</button>
+      </div>
+    </section>
+
+    <aside class="right-col">
+      <div class="card">
+        <h2>Spending by Category</h2>
+        <canvas id="categoryChart" height="240"></canvas>
+      </div>
+
+      <div class="card">
+        <h2>Spending by Month</h2>
+        <canvas id="monthChart" height="240"></canvas>
+      </div>
+
+      <div class="card summary">
+        <h3>Summary</h3>
+        <p>Total expenses: <strong id="total-expenses">₹0.00</strong></p>
+        <p>Unique categories: <strong id="unique-cats">0</strong></p>
+      </div>
+    </aside>
+  </main>
+
+  <footer class="footer">
+    <small>Frontend expects a REST API at <code>/api/</code> — see comments below.</small>
+  </footer>
+
+<script>
+/*
+  Frontend expectations (wire your backend to these endpoints):
+  - GET  /api/expenses?page=<n>&per_page=<m>
+      returns JSON: { data: [{id,date,category,amount,description}], total: <int> }
+  - POST /api/expenses
+      body JSON: { date: "YYYY-MM-DD", category: "Food", amount: 12.34, description: "..." }
+      returns 201 or the created object
+  - GET  /api/reports/category
+      returns: [{ category: "Food", total: 123.45 }, ... ]
+  - GET  /api/reports/month
+      returns: [{ month: "2025-10", total: 456.78 }, ... ]
+
+  If you want, I can generate matching Flask endpoints that use your DB classes.
+*/
+
+const perPage = 8;
+let currentPage = 1;
+let totalRecords = 0;
+
+document.addEventListener('DOMContentLoaded', () => {
+  const form = document.getElementById('expense-form');
+  form.addEventListener('submit', onAddExpense);
+  document.getElementById('refresh-btn').addEventListener('click', refreshAll);
+  document.getElementById('prev-page').addEventListener('click', () => changePage(-1));
+  document.getElementById('next-page').addEventListener('click', () => changePage(1));
+
+  // initial load
+  refreshAll();
+});
+
+async function onAddExpense(e) {
+  e.preventDefault();
+  const payload = {
+    date: document.getElementById('date').value,
+    category: document.getElementById('category').value.trim(),
+    amount: parseFloat(document.getElementById('amount').value),
+    description: document.getElementById('description').value.trim()
+  };
+
+  try {
+    const res = await fetch('/api/expenses', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error('Failed to add expense');
+    // reset form
+    e.target.reset();
+    currentPage = 1;
+    await refreshAll();
+  } catch (err) {
+    alert('Error: ' + err.message);
+    console.error(err);
+  }
+}
+
+async function fetchExpenses(page = 1) {
+  const res = await fetch(`/api/expenses?page=${page}&per_page=${perPage}`);
+  if (!res.ok) throw new Error('Failed to fetch expenses');
+  return res.json(); // { data: [...], total: <int> }
+}
+
+async function fetchCategoryReport() {
+  const res = await fetch('/api/reports/category');
+  if (!res.ok) throw new Error('Failed to fetch category report');
+  return res.json();
+}
+
+async function fetchMonthReport() {
+  const res = await fetch('/api/reports/month');
+  if (!res.ok) throw new Error('Failed to fetch month report');
+  return res.json();
+}
+
+function formatCurrency(num) {
+  // simple INR formatting fallback
+  if (typeof num !== 'number') num = parseFloat(num) || 0;
+  return '₹' + num.toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2});
+}
+
+async function refreshAll() {
+  try {
+    await loadExpenses(currentPage);
+    await loadCharts();
+  } catch (err) {
+    console.error(err);
+    // show friendly message, but do not block UI
+  }
+}
+
+async function loadExpenses(page) {
+  const payload = await fetchExpenses(page);
+  const rows = payload.data || [];
+  totalRecords = payload.total || rows.length;
+  populateTable(rows);
+  updatePaginationInfo();
+  updateSummary(rows);
+}
+
+function populateTable(rows) {
+  const tbody = document.querySelector('#expenses-table tbody');
+  tbody.innerHTML = '';
+  if (rows.length === 0) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td colspan="4" class="muted">No expenses found</td>';
+    tbody.appendChild(tr);
+    return;
+  }
+
+  rows.forEach(r => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${r.date}</td>
+      <td>${escapeHtml(r.category)}</td>
+      <td class="amt">${formatCurrency(r.amount)}</td>
+      <td>${escapeHtml(r.description || '')}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+function updatePaginationInfo() {
+  const pageInfo = document.getElementById('page-info');
+  const lastPage = Math.max(1, Math.ceil((totalRecords || 0) / perPage));
+  pageInfo.textContent = `Page ${currentPage} of ${lastPage}`;
+  document.getElementById('prev-page').disabled = currentPage <= 1;
+  document.getElementById('next-page').disabled = currentPage >= lastPage;
+}
+
+function changePage(delta) {
+  currentPage = Math.max(1, currentPage + delta);
+  refreshAll();
+}
+
+function updateSummary(rows) {
+  // summary shown is just for currently loaded page (quick)
+  const total = rows.reduce((s, r) => s + Number(r.amount || 0), 0);
+  const cats = Array.from(new Set(rows.map(r => r.category))).length;
+  document.getElementById('total-expenses').textContent = formatCurrency(total);
+  document.getElementById('unique-cats').textContent = cats;
+}
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+/* Charts */
+let categoryChart = null;
+let monthChart = null;
+
+async function loadCharts() {
+  const catData = await fetchCategoryReport();
+  const monthData = await fetchMonthReport();
+
+  renderCategoryChart(catData || []);
+  renderMonthChart(monthData || []);
+}
+
+function renderCategoryChart(data) {
+  const labels = data.map(d => d.category);
+  const totals = data.map(d => Number(d.total));
+
+  const ctx = document.getElementById('categoryChart').getContext('2d');
+  if (categoryChart) categoryChart.destroy();
+  categoryChart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Total',
+        data: totals,
+        // Chart.js will choose defaults; don't force colors here
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { display: false }
+      },
+      scales: {
+        y: { beginAtZero: true }
+      }
+    }
+  });
+}
+
+function renderMonthChart(data) {
+  const labels = data.map(d => d.month);
+  const totals = data.map(d => Number(d.total));
+
+  const ctx = document.getElementById('monthChart').getContext('2d');
+  if (monthChart) monthChart.destroy();
+  monthChart = new Chart(ctx, {
+    type: 'pie',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Total by month',
+        data: totals
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { position: 'bottom' }
+      }
+    }
+  });
+}
+</script>
+</body>
+</html>
